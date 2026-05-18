@@ -1,0 +1,43 @@
+# ── LLM & AI ─────────────────────────────────────────────────────────────────
+google-genai>=0.8.0               # Gemini API (free tier)
+
+# ── Agent Orchestration ───────────────────────────────────────────────────────
+langgraph>=0.2.0
+langchain-core>=0.3.0
+
+# ── RAG / Vector DB ───────────────────────────────────────────────────────────
+chromadb>=0.5.0
+sentence-transformers>=3.0.0      # Local embedding model (free, no API)
+
+# ── CV Parsing ────────────────────────────────────────────────────────────────
+pdfplumber>=0.11.0                # PDF native text extraction
+python-docx>=1.1.0                # DOCX extraction
+pytesseract>=0.3.10               # OCR fallback (cần Tesseract binary)
+pdf2image>=1.17.0                 # PDF → image cho OCR
+Pillow>=10.0.0
+
+# ── PDF Report Generation ─────────────────────────────────────────────────────
+reportlab>=4.0.0
+
+# ── Backend ───────────────────────────────────────────────────────────────────
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9           # File upload support
+
+# ── Frontend ──────────────────────────────────────────────────────────────────
+chainlit>=1.1.0
+httpx>=0.27.0                     # Chainlit → FastAPI HTTP calls
+
+# ── AWS ───────────────────────────────────────────────────────────────────────
+boto3>=1.34.0                     # S3 upload (optional, có fallback local)
+
+# ── Data Validation ───────────────────────────────────────────────────────────
+pydantic>=2.6.0
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+python-dotenv>=1.0.0              # Load .env file
+
+# ── Testing ───────────────────────────────────────────────────────────────────
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+httpx>=0.27.0                     # FastAPI test client
