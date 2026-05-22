@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import time
 from pathlib import Path
@@ -24,6 +25,9 @@ from typing import Any
 
 from google import genai
 from google.genai import types as genai_types
+
+from dotenv import load_dotenv
+load_dotenv()
 
 from prompts.parser_prompt import PARSER_SYSTEM_PROMPT, PARSER_USER_TEMPLATE
 from schemas.cv_schema import (
@@ -284,7 +288,7 @@ class CVParserAgent:
         )
 
 if __name__ == '__main__':
-    GOOGLE_API_KEY = 'REMOVED'
+    GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
     agent = CVParserAgent(api_key=GOOGLE_API_KEY)
     profile = agent.parse("C:/Users/DuongLe(EXT)/WorkSapce/hr-cv-scanner/data/CV_18_Bui_Thi_Zung.pdf")
     print(profile.full_name, profile.total_experience_years, profile.education)

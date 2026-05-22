@@ -54,6 +54,12 @@ pipeline_graph: Any = None
 async def lifespan(app: FastAPI):
     """Build LangGraph graph on startup."""
     global pipeline_graph
+
+    from api.tracer import setup_langsmith
+    tracing_enabled = setup_langsmith(project_name="hr-cv-scanner")
+    if tracing_enabled:
+        logger.info("LangSmith dashboard: https://smith.langchain.com")
+
     logger.info("Building LangGraph pipeline...")
     from graph.workflow import build_graph
     pipeline_graph = build_graph()
@@ -72,7 +78,7 @@ app = FastAPI(
 # CORS — allow Chainlit frontend (port 8001) to call this API (port 8000)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins     = ["http://localhost:8001", "http://127.0.0.1:8001"],
+    allow_origins     = ["http://localhost:8001", "http://127.0.0.1:8001", "http://localhost:8501", "http://127.0.0.1:8501"],
     allow_credentials = True,
     allow_methods     = ["*"],
     allow_headers     = ["*"],
