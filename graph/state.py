@@ -41,6 +41,7 @@ import operator
 from pydantic import BaseModel, Field
 
 from schemas.cv_schema import CandidateProfile
+from agents.cv_parser import ParsedCV
 from schemas.match_schema import MatchResult
 from schemas.report_schema import ReportOutput
 from schemas.score_schema import RankedCandidate
@@ -70,6 +71,7 @@ class GraphState(BaseModel):
     file_paths:  list[str] = Field(default_factory=list)
     job_id:      str       = ""
     job_title:   str       = ""
+    jd_text:   str       = ""
     api_key:     str       = ""  # Gemini API key
 
     # ── PIPELINE PROGRESS ────────────────────────────────────────────────────
@@ -79,7 +81,7 @@ class GraphState(BaseModel):
 
     # ── NODE OUTPUTS ─────────────────────────────────────────────────────────
     # Annotated với operator.add để list được append thay vì replace
-    parsed_candidates: Annotated[list[CandidateProfile], operator.add] = Field(
+    parsed_candidates: Annotated[list[ParsedCV], operator.add] = Field(
         default_factory=list
     )
     parse_errors: Annotated[list[str], operator.add] = Field(

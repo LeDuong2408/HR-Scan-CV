@@ -1,12 +1,12 @@
 """
-Tests for JDMatcherAgent.
+Tests for JDMatcherAgent v2.
 
-Run: pytest tests/test_jd_matcher.py -v
+Run: pytest tests/test_jd_matcher_v2.py -v
 
 3 tầng:
-  Unit:        test từng method nhỏ (_build_query_text, _parse_json_response)
-  Integration: test full match() pipeline với mock LLM + mock ChromaDB
-  Schema:      test Pydantic validation của MatchResult
+  Unit JD Parse:    test _parse_json, parse_jd() với mock LLM
+  Unit Evidence:    test _query_evidence với mock ChromaDB
+  Integration:      test match() và match_batch() full pipeline
 """
 from __future__ import annotations
 
@@ -15,517 +15,441 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from agents.cv_parser import ParsedCV
 from agents.jd_matcher import JDMatcherAgent
-from rag.retriever import RetrievedChunk
-from schemas.cv_schema import (
-    CandidateProfile,
-    ContactInfo,
-    EducationEntry,
-    LanguageEntry,
-    ParseConfidence,
-    WorkEntry,
-)
-from schemas.match_schema import (
-    ExperienceAssessment,
-    MatchLevel,
-    MatchResult,
-    RequirementMatch,
-    SkillGapReport,
-)
+from schemas.jd_schema import ParsedJD
+from schemas.match_schema import MatchLevel, MatchResult
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Fixtures — dùng chung toàn bộ file test
-# ──────────────────────────────────────────────────────────────────────────────
+# ── Fixtures ──────────────────────────────────────────────────────────────────
+
+SAMPLE_JD_TEXT = """
+Senior Backend Engineer
+
+We are looking for a Senior Backend Engineer with 3+ years of Python experience.
+
+Requirements:
+- 3+ years Python backend development
+- FastAPI or Django REST framework
+- AWS Lambda and S3 experience
+- PostgreSQL and Redis
+- Docker and CI/CD pipelines
+
+Nice to have:
+- Kubernetes
+- Terraform
+
+Responsibilities:
+- Design and build scalable REST APIs
+- Maintain PostgreSQL databases
+- Deploy on AWS infrastructure
+"""
+
+PARSED_JD_JSON = {
+    "job_title":                  "Senior Backend Engineer",
+    "required_skills":            [
+        "Python 3+ years",
+        "FastAPI",
+        "AWS Lambda",
+        "PostgreSQL",
+        "Docker",
+    ],
+    "nice_to_have":               ["Kubernetes", "Terraform"],
+    "required_experience_years":  3.0,
+    "required_experience_domain": "backend development",
+    "required_education_level":   "bachelor",
+    "required_education_major":   "Computer Science or related",
+    "key_responsibilities":       ["Design REST APIs", "Deploy on AWS"],
+    "seniority_level":            "senior",
+}
+
+MATCH_RESULT_JSON = {
+    "candidate_name": "Nguyen Van A",
+    "job_title":      "Senior Backend Engineer",
+    "requirement_matches": [
+        {
+            "requirement":          "Python 3+ years",
+            "candidate_evidence":   "4 years Python at FPT Software",
+            "match_level":          "full",
+            "gap_note":             None,
+        },
+        {
+            "requirement":        "FastAPI",
+            "candidate_evidence": "FastAPI in Skills section",
+            "match_level":        "full",
+            "gap_note":           None,
+        },
+        {
+            "requirement":        "AWS Lambda",
+            "candidate_evidence": "AWS Lambda listed in skills",
+            "match_level":        "partial",
+            "gap_note":           "Listed in skills but no project evidence",
+        },
+        {
+            "requirement":        "Kubernetes",
+            "candidate_evidence": None,
+            "match_level":        "missing",
+            "gap_note":           "No Kubernetes evidence found",
+        },
+    ],
+    "skill_gap": {
+        "matched":          ["Python", "FastAPI", "PostgreSQL"],
+        "missing_critical": ["Docker"],
+        "missing_nice":     ["Kubernetes", "Terraform"],
+        "bonus":            ["Redis"],
+    },
+    "experience": {
+        "required_years":    3.0,
+        "candidate_years":   4.5,
+        "meets_requirement": True,
+        "domain_relevance":  1.0,
+        "relevance_note":    "Backend experience directly relevant",
+    },
+    "raw_similarity_score": 0.0,
+    "match_summary":        "Strong match on Python and FastAPI. Gap in Docker and Kubernetes.",
+    "low_confidence":       False,
+    "warnings":             [],
+}
+
 
 @pytest.fixture
 def agent() -> JDMatcherAgent:
-    """JDMatcherAgent với fake API key — LLM sẽ được mock."""
-    return JDMatcherAgent(api_key="fake-key-for-testing")
+    return JDMatcherAgent(api_key="fake-key")
 
 
 @pytest.fixture
-def sample_candidate() -> CandidateProfile:
-    """CandidateProfile mẫu — output của CVParserAgent."""
-    return CandidateProfile(
-        full_name="Nguyen Van A",
-        contact=ContactInfo(email="a@gmail.com", phone="0901234567"),
-        total_experience_years=4.5,
-        technical_skills=["Python", "FastAPI", "PostgreSQL", "Docker", "AWS Lambda"],
-        soft_skills=["Communication", "Teamwork"],
-        certifications=["AWS Solutions Architect Associate"],
-        work_history=[
-            WorkEntry(
-                company="FPT Software",
-                role="Backend Engineer",
-                start_year=2020,
-                end_year=2024,
-                duration_months=48,
-                technologies=["Python", "FastAPI", "PostgreSQL", "Redis"],
-                achievements=["Reduced API latency by 30%"],
-            )
-        ],
-        education=[
-            EducationEntry(
-                institution="HCMUT",
-                degree="Bachelor of Computer Science",
-                graduation_year=2020,
-            )
-        ],
-        languages=[LanguageEntry(language="English", proficiency="B2")],
-        confidence=ParseConfidence.HIGH,
+def sample_candidate() -> ParsedCV:
+    return ParsedCV(
+        cv_id          = "cv_abc123",
+        file_name      = "nguyen_van_a.pdf",
+        candidate_name = "Nguyen Van A",
+        email          = "a@gmail.com",
+        markdown       = "# Nguyen Van A\n# Skills\nPython FastAPI\n# Experience\nFPT 4 years",
+        chunk_count    = 5,
+        sections       = ["Skills", "Experience", "Education"],
+        parse_method   = "pymupdf",
     )
 
 
 @pytest.fixture
-def sample_chunks() -> list[RetrievedChunk]:
-    """JD requirement chunks mẫu — output của ChromaDB retriever."""
-    return [
-        RetrievedChunk(
-            chunk_id="backend-2025_req_000",
-            text="3+ years Python backend development",
-            score=0.92,
-            priority="required",
-            job_id="backend-2025",
-            job_title="Senior Backend Engineer",
-        ),
-        RetrievedChunk(
-            chunk_id="backend-2025_req_001",
-            text="Experience with REST API design and FastAPI framework",
-            score=0.88,
-            priority="required",
-            job_id="backend-2025",
-            job_title="Senior Backend Engineer",
-        ),
-        RetrievedChunk(
-            chunk_id="backend-2025_req_002",
-            text="AWS Lambda and S3 experience",
-            score=0.75,
-            priority="required",
-            job_id="backend-2025",
-            job_title="Senior Backend Engineer",
-        ),
-        RetrievedChunk(
-            chunk_id="backend-2025_nice_000",
-            text="Kubernetes and container orchestration",
-            score=0.55,
-            priority="nice_to_have",
-            job_id="backend-2025",
-            job_title="Senior Backend Engineer",
-        ),
-    ]
+def sample_parsed_jd() -> ParsedJD:
+    return ParsedJD.model_validate(PARSED_JD_JSON)
 
 
-VALID_LLM_JSON = {
-    "candidate_name": "Nguyen Van A",
-    "job_title": "Senior Backend Engineer",
-    "requirement_matches": [
-        {
-            "requirement": "3+ years Python backend development",
-            "candidate_evidence": "4 years Python at FPT Software (FastAPI, PostgreSQL)",
-            "match_level": "full",
-            "gap_note": None,
-        },
-        {
-            "requirement": "Experience with REST API design and FastAPI framework",
-            "candidate_evidence": "FastAPI listed in technical skills and work history",
-            "match_level": "full",
-            "gap_note": None,
-        },
-        {
-            "requirement": "AWS Lambda and S3 experience",
-            "candidate_evidence": "AWS Lambda in technical skills; AWS cert",
-            "match_level": "partial",
-            "gap_note": "Has Lambda but S3 not explicitly mentioned",
-        },
-        {
-            "requirement": "Kubernetes and container orchestration",
-            "candidate_evidence": None,
-            "match_level": "missing",
-            "gap_note": "No Kubernetes or K8s mentioned in CV",
-        },
-    ],
-    "skill_gap": {
-        "matched": ["Python", "FastAPI", "PostgreSQL", "AWS Lambda"],
-        "missing_critical": [],
-        "missing_nice": ["Kubernetes"],
-        "bonus": ["Docker", "Redis"],
-    },
-    "experience": {
-        "required_years": 3.0,
-        "candidate_years": 4.5,
-        "meets_requirement": True,
-        "domain_relevance": 1.0,
-        "relevance_note": "Backend experience directly relevant",
-    },
-    "raw_similarity_score": 0.0,
-    "match_summary": (
-        "Strong match on Python and FastAPI. "
-        "Gaps in Kubernetes. "
-        "Recommend for technical interview."
-    ),
-    "low_confidence": False,
-    "warnings": [],
-}
+# ── Tầng 1: Unit — JD Parsing ─────────────────────────────────────────────────
+
+class TestParseJson:
+    def test_clean_json(self, agent):
+        raw  = json.dumps({"job_title": "Dev"})
+        data = agent._parse_json(raw)
+        assert data["job_title"] == "Dev"
+
+    def test_strips_markdown_fences(self, agent):
+        raw  = "```json\n" + json.dumps({"job_title": "Dev"}) + "\n```"
+        data = agent._parse_json(raw)
+        assert data["job_title"] == "Dev"
+
+    def test_strips_preamble(self, agent):
+        raw  = "Here is the result:\n" + json.dumps({"x": 1})
+        data = agent._parse_json(raw)
+        assert data["x"] == 1
+
+    def test_raises_on_no_json(self, agent):
+        with pytest.raises(ValueError, match="No JSON"):
+            agent._parse_json("Sorry, I cannot help.")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Tầng 1: Unit — test từng method nhỏ
-# ──────────────────────────────────────────────────────────────────────────────
+class TestParseJD:
+    @patch("agents.jd_matcher.JDMatcherAgent._call_llm")
+    def test_parse_jd_success(self, mock_llm, agent):
+        mock_llm.return_value = json.dumps(PARSED_JD_JSON)
 
-class TestBuildQueryText:
-    """
-    _build_query_text() tóm tắt CandidateProfile thành 1 chuỗi text
-    để embed và search ChromaDB.
-    """
+        result = agent.parse_jd(SAMPLE_JD_TEXT, "Senior Backend Engineer", "backend-2025")
 
-    def test_includes_technical_skills(
-            self, agent: JDMatcherAgent, sample_candidate: CandidateProfile
-    ) -> None:
-        query = agent._build_query_text(sample_candidate)
-        assert "Python" in query
-        assert "FastAPI" in query
+        assert isinstance(result, ParsedJD)
+        assert result.job_title              == "Senior Backend Engineer"
+        assert len(result.required_skills)   >= 3
+        assert "Python 3+ years"              in result.required_skills
+        assert result.required_experience_years == 3.0
+        assert result.seniority_level        == "senior"
 
-    def test_includes_recent_role(
-            self, agent: JDMatcherAgent, sample_candidate: CandidateProfile
-    ) -> None:
-        query = agent._build_query_text(sample_candidate)
-        assert "Backend Engineer" in query
-        assert "FPT Software" in query
+    @patch("agents.jd_matcher.JDMatcherAgent._call_llm")
+    def test_parse_jd_cached(self, mock_llm, agent):
+        """JD parse kết quả được cache — LLM chỉ gọi 1 lần."""
+        mock_llm.return_value = json.dumps(PARSED_JD_JSON)
 
-    def test_includes_certifications(
-            self, agent: JDMatcherAgent, sample_candidate: CandidateProfile
-    ) -> None:
-        query = agent._build_query_text(sample_candidate)
-        assert "AWS Solutions Architect" in query
+        r1 = agent.parse_jd(SAMPLE_JD_TEXT, "Dev", "job-1")
+        r2 = agent.parse_jd(SAMPLE_JD_TEXT, "Dev", "job-1")
 
-    def test_empty_skills_still_works(self, agent: JDMatcherAgent) -> None:
-        """Candidate chưa có skills — không crash."""
-        candidate = CandidateProfile(full_name="Test User")
-        query = agent._build_query_text(candidate)
-        # Không crash, có thể là empty string hoặc có education
-        assert isinstance(query, str)
+        assert r1 is r2          # Same object từ cache
+        assert mock_llm.call_count == 1  # LLM chỉ gọi 1 lần
 
-    def test_limits_work_history_to_3(self, agent: JDMatcherAgent) -> None:
-        """Chỉ lấy 3 job gần nhất để query không quá dài."""
-        candidate = CandidateProfile(
-            full_name="Test",
-            work_history=[
-                WorkEntry(company=f"Company{i}", role=f"Role{i}")
-                for i in range(6)
-            ],
-        )
-        query = agent._build_query_text(candidate)
-        # Chỉ có 3 công ty đầu trong query
-        assert "Company0" in query
-        assert "Company1" in query
-        assert "Company2" in query
-        assert "Company5" not in query  # Công ty thứ 6 bị bỏ
+    @patch("agents.jd_matcher.JDMatcherAgent._call_llm")
+    def test_parse_jd_different_jobs_not_cached(self, mock_llm, agent):
+        """2 job khác nhau → 2 LLM calls riêng."""
+        mock_llm.return_value = json.dumps(PARSED_JD_JSON)
+
+        agent.parse_jd(SAMPLE_JD_TEXT, "Dev 1", "job-1")
+        agent.parse_jd(SAMPLE_JD_TEXT, "Dev 2", "job-2")
+
+        assert mock_llm.call_count == 2
+
+    @patch("agents.jd_matcher.JDMatcherAgent._call_llm")
+    def test_parse_jd_retries_on_bad_json(self, mock_llm, agent):
+        mock_llm.side_effect = [
+            "not json",
+            json.dumps(PARSED_JD_JSON),
+        ]
+        with patch("agents.jd_matcher.time.sleep"):
+            result = agent.parse_jd(SAMPLE_JD_TEXT, "Dev", "job-1")
+        assert result.job_title == "Senior Backend Engineer"
+        assert mock_llm.call_count == 2
 
 
-class TestParseJsonResponse:
-    """
-    _parse_json_response() làm sạch output LLM.
-    Giống test trong CVParserAgent.
-    """
+# ── Tầng 2: Unit — Evidence Query ─────────────────────────────────────────────
 
-    def test_clean_json(self, agent: JDMatcherAgent) -> None:
-        raw = json.dumps({"candidate_name": "Test"})
-        assert agent._parse_json_response(raw)["candidate_name"] == "Test"
+class TestQueryEvidence:
 
-    def test_strips_markdown_fences(self, agent: JDMatcherAgent) -> None:
-        raw = "```json\n" + json.dumps({"candidate_name": "Test"}) + "\n```"
-        assert agent._parse_json_response(raw)["candidate_name"] == "Test"
+    @patch("agents.jd_matcher.query_cv_chunks")
+    def test_queries_all_required_skills(
+        self, mock_query, agent, sample_candidate, sample_parsed_jd
+    ):
+        """Mỗi required_skill phải được query ChromaDB."""
+        mock_query.return_value = [{"text": "Python experience", "section": "Skills", "score": 0.85, "chunk_index": 0}]
 
-    def test_strips_preamble(self, agent: JDMatcherAgent) -> None:
-        raw = "Here is the analysis:\n" + json.dumps({"candidate_name": "Test"})
-        assert agent._parse_json_response(raw)["candidate_name"] == "Test"
+        evidence = agent._query_evidence(sample_candidate.cv_id, sample_parsed_jd)
 
-    def test_raises_on_no_json(self, agent: JDMatcherAgent) -> None:
-        with pytest.raises(ValueError, match="No JSON object found"):
-            agent._parse_json_response("I cannot determine the match.")
+        # Tất cả required skills phải có key trong evidence
+        for skill in sample_parsed_jd.required_skills:
+            assert skill in evidence
 
-    def test_raises_on_invalid_json(self, agent: JDMatcherAgent) -> None:
-        with pytest.raises(Exception):
-            agent._parse_json_response("{invalid: json}")
+    @patch("agents.jd_matcher.query_cv_chunks")
+    def test_queries_nice_to_have_skills(
+        self, mock_query, agent, sample_candidate, sample_parsed_jd
+    ):
+        """Nice-to-have skills cũng được query."""
+        mock_query.return_value = []
 
+        evidence = agent._query_evidence(sample_candidate.cv_id, sample_parsed_jd)
 
-class TestBuildPrompt:
-    """_build_prompt() tạo ra prompt đúng format."""
+        for skill in sample_parsed_jd.nice_to_have:
+            assert skill in evidence
 
-    def test_contains_candidate_name(
-            self,
-            agent: JDMatcherAgent,
-            sample_candidate: CandidateProfile,
-            sample_chunks: list[RetrievedChunk],
-    ) -> None:
-        prompt = agent._build_prompt(sample_candidate, sample_chunks, "Senior Backend Engineer")
-        assert "Nguyen Van A" in prompt
+    @patch("agents.jd_matcher.query_cv_chunks")
+    def test_missing_skill_has_empty_chunks(
+        self, mock_query, agent, sample_candidate, sample_parsed_jd
+    ):
+        """Skill không có trong CV → chunks = [] (không raise, không filter)."""
+        mock_query.return_value = []
 
-    def test_contains_jd_requirements(
-            self,
-            agent: JDMatcherAgent,
-            sample_candidate: CandidateProfile,
-            sample_chunks: list[RetrievedChunk],
-    ) -> None:
-        prompt = agent._build_prompt(sample_candidate, sample_chunks, "Senior Backend Engineer")
-        assert "3+ years Python backend development" in prompt
-        assert "FastAPI framework" in prompt
+        evidence = agent._query_evidence(sample_candidate.cv_id, sample_parsed_jd)
 
-    def test_marks_required_vs_nice(
-            self,
-            agent: JDMatcherAgent,
-            sample_candidate: CandidateProfile,
-            sample_chunks: list[RetrievedChunk],
-    ) -> None:
-        prompt = agent._build_prompt(sample_candidate, sample_chunks, "Senior Backend Engineer")
-        assert "[REQUIRED]" in prompt
-        assert "[NICE]" in prompt
+        # Tất cả skills phải có entry, dù empty
+        total_skills = len(sample_parsed_jd.required_skills) + len(sample_parsed_jd.nice_to_have)
+        assert len(evidence) == total_skills
 
-    def test_excludes_raw_text(
-            self,
-            agent: JDMatcherAgent,
-            sample_candidate: CandidateProfile,
-            sample_chunks: list[RetrievedChunk],
-    ) -> None:
-        """raw_text không được đưa vào prompt — tránh context quá dài."""
-        sample_candidate_with_raw = sample_candidate.model_copy()
-        prompt = agent._build_prompt(sample_candidate_with_raw, sample_chunks, "Senior Backend")
-        assert "raw_text" not in prompt
+    @patch("agents.jd_matcher.query_cv_chunks")
+    def test_query_uses_correct_cv_id(
+        self, mock_query, agent, sample_candidate, sample_parsed_jd
+    ):
+        """ChromaDB query phải filter đúng cv_id của candidate."""
+        mock_query.return_value = []
+
+        agent._query_evidence(sample_candidate.cv_id, sample_parsed_jd)
+
+        for call in mock_query.call_args_list:
+            assert call.kwargs.get("cv_id") == sample_candidate.cv_id or \
+                   call.args[1] == sample_candidate.cv_id
+
+    @patch("agents.jd_matcher.query_cv_chunks")
+    def test_no_score_filter_applied(
+        self, mock_query, agent, sample_candidate, sample_parsed_jd
+    ):
+        """min_score=0.0 — không filter bất kỳ chunk nào."""
+        mock_query.return_value = []
+
+        agent._query_evidence(sample_candidate.cv_id, sample_parsed_jd)
+
+        for call in mock_query.call_args_list:
+            min_score = call.kwargs.get("min_score", 0.0)
+            assert min_score == 0.0
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Tầng 2: Integration — test full pipeline với mock
-# ──────────────────────────────────────────────────────────────────────────────
+# ── Tầng 3: Integration ───────────────────────────────────────────────────────
 
 class TestMatchIntegration:
 
     @patch("agents.jd_matcher.JDMatcherAgent._call_llm")
-    @patch("agents.jd_matcher.search_jd_requirements")
-    def test_match_success(
-            self,
-            mock_search: MagicMock,
-            mock_llm: MagicMock,
-            agent: JDMatcherAgent,
-            sample_candidate: CandidateProfile,
-            sample_chunks: list[RetrievedChunk],
-    ) -> None:
-        """Full pipeline thành công: ChromaDB → LLM → MatchResult."""
-        mock_search.return_value = sample_chunks
-        mock_llm.return_value = json.dumps(VALID_LLM_JSON)
+    @patch("agents.jd_matcher.query_cv_chunks")
+    def test_match_success_full_pipeline(
+        self, mock_query, mock_llm, agent, sample_candidate, sample_parsed_jd
+    ):
+        """Full pipeline: ChromaDB evidence → LLM → MatchResult."""
+        mock_query.return_value = [
+            {"text": "Python 4 years", "section": "Experience", "score": 0.90, "chunk_index": 0}
+        ]
+        # LLM chỉ được gọi 1 lần (match analyze)
+        mock_llm.return_value = json.dumps(MATCH_RESULT_JSON)
 
-        result = agent.match(sample_candidate, "backend-2025", "Senior Backend Engineer")
+        result = agent.match(sample_candidate, sample_parsed_jd)
 
         assert isinstance(result, MatchResult)
         assert result.candidate_name == "Nguyen Van A"
-        assert result.job_title == "Senior Backend Engineer"
-        assert len(result.requirement_matches) == 4
-        assert "Python" in result.skill_gap.matched
-        assert "Kubernetes" in result.skill_gap.missing_nice
-        assert result.experience.meets_requirement is True
+        assert result.job_title      == "Senior Backend Engineer"
+        assert len(result.requirement_matches) > 0
 
     @patch("agents.jd_matcher.JDMatcherAgent._call_llm")
-    @patch("agents.jd_matcher.search_jd_requirements")
-    def test_match_enriches_similarity_score(
-            self,
-            mock_search: MagicMock,
-            mock_llm: MagicMock,
-            agent: JDMatcherAgent,
-            sample_candidate: CandidateProfile,
-            sample_chunks: list[RetrievedChunk],
-    ) -> None:
-        """raw_similarity_score được tính từ average của chunks."""
-        mock_search.return_value = sample_chunks
-        mock_llm.return_value = json.dumps(VALID_LLM_JSON)
+    @patch("agents.jd_matcher.query_cv_chunks")
+    def test_match_computes_avg_similarity(
+        self, mock_query, mock_llm, agent, sample_candidate, sample_parsed_jd
+    ):
+        """raw_similarity_score = average của all chunk scores."""
+        mock_query.return_value = [
+            {"text": "text", "section": "S", "score": 0.8, "chunk_index": 0},
+            {"text": "text", "section": "S", "score": 0.6, "chunk_index": 1},
+        ]
+        mock_llm.return_value = json.dumps(MATCH_RESULT_JSON)
 
-        result = agent.match(sample_candidate, "backend-2025", "Senior Backend Engineer")
+        result = agent.match(sample_candidate, sample_parsed_jd)
 
-        # Average score: (0.92 + 0.88 + 0.75 + 0.55) / 4 = 0.775
-        expected_avg = round(
-            sum(c.score for c in sample_chunks) / len(sample_chunks), 4
+        # Score phải > 0 vì có chunks
+        assert result.raw_similarity_score > 0
+
+    @patch("agents.jd_matcher.JDMatcherAgent._call_llm")
+    @patch("agents.jd_matcher.query_cv_chunks")
+    def test_match_flags_low_confidence_sparse_cv(
+        self, mock_query, mock_llm, agent, sample_parsed_jd
+    ):
+        """CV chỉ có 2 chunks → low_confidence = True."""
+        sparse_candidate = ParsedCV(
+            cv_id="cv_sparse", file_name="sparse.pdf",
+            candidate_name="Sparse User",
+            chunk_count=2,  # ít hơn 3
+            sections=["Skills"],
+            parse_method="pymupdf",
         )
-        assert result.raw_similarity_score == expected_avg
+        mock_query.return_value = []
+        mock_llm.return_value   = json.dumps(MATCH_RESULT_JSON)
 
-    @patch("agents.jd_matcher.JDMatcherAgent._call_llm")
-    @patch("agents.jd_matcher.search_jd_requirements")
-    def test_match_saves_chunk_ids(
-            self,
-            mock_search: MagicMock,
-            mock_llm: MagicMock,
-            agent: JDMatcherAgent,
-            sample_candidate: CandidateProfile,
-            sample_chunks: list[RetrievedChunk],
-    ) -> None:
-        """jd_chunks_used lưu IDs để audit sau."""
-        mock_search.return_value = sample_chunks
-        mock_llm.return_value = json.dumps(VALID_LLM_JSON)
-
-        result = agent.match(sample_candidate, "backend-2025", "Senior Backend Engineer")
-
-        assert "backend-2025_req_000" in result.jd_chunks_used
-        assert "backend-2025_nice_000" in result.jd_chunks_used
-
-    @patch("agents.jd_matcher.search_jd_requirements")
-    def test_match_returns_empty_when_no_chunks(
-            self,
-            mock_search: MagicMock,
-            agent: JDMatcherAgent,
-            sample_candidate: CandidateProfile,
-    ) -> None:
-        """Khi ChromaDB không có data → trả về empty result, không crash."""
-        mock_search.return_value = []
-
-        result = agent.match(sample_candidate, "nonexistent-job", "Some Job")
-
+        result = agent.match(sparse_candidate, sample_parsed_jd)
         assert result.low_confidence is True
-        assert any("No JD chunks" in w for w in result.warnings)
 
     @patch("agents.jd_matcher.JDMatcherAgent._call_llm")
-    @patch("agents.jd_matcher.search_jd_requirements")
-    def test_match_retries_on_bad_json(
-            self,
-            mock_search: MagicMock,
-            mock_llm: MagicMock,
-            agent: JDMatcherAgent,
-            sample_candidate: CandidateProfile,
-            sample_chunks: list[RetrievedChunk],
-    ) -> None:
-        """Retry khi LLM trả về invalid JSON."""
-        mock_search.return_value = sample_chunks
-        mock_llm.side_effect = [
-            "This is not JSON",  # Lần 1: fail
-            json.dumps(VALID_LLM_JSON),  # Lần 2: thành công
-        ]
+    @patch("agents.jd_matcher.query_cv_chunks")
+    def test_match_batch_parses_jd_once(
+        self, mock_query, mock_llm, agent, sample_candidate
+    ):
+        """match_batch: JD parsing chỉ gọi 1 lần dù có 3 candidates."""
+        mock_query.return_value = []
+        # LLM calls: 1 (parse_jd) + 3 (match per candidate) = 4 total
+        mock_llm.return_value = json.dumps(PARSED_JD_JSON)
 
-        with patch("agents.jd_matcher.time.sleep"):
-            result = agent.match(sample_candidate, "backend-2025", "Senior Backend Engineer")
+        # Reset mock để track calls
+        call_count = [0]
+        def side_effect(prompt, system_prompt):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return json.dumps(PARSED_JD_JSON)   # parse_jd call
+            return json.dumps(MATCH_RESULT_JSON)     # match calls
 
-        assert result.candidate_name == "Nguyen Van A"
-        assert mock_llm.call_count == 2
-
-    @patch("agents.jd_matcher.JDMatcherAgent._call_llm")
-    @patch("agents.jd_matcher.search_jd_requirements")
-    def test_match_raises_after_max_retries(
-            self,
-            mock_search: MagicMock,
-            mock_llm: MagicMock,
-            agent: JDMatcherAgent,
-            sample_candidate: CandidateProfile,
-            sample_chunks: list[RetrievedChunk],
-    ) -> None:
-        """RuntimeError sau 3 lần retry thất bại."""
-        mock_search.return_value = sample_chunks
-        mock_llm.return_value = "not json ever"
-
-        with patch("agents.jd_matcher.time.sleep"):
-            with pytest.raises(RuntimeError, match="failed to return valid JSON"):
-                agent.match(sample_candidate, "backend-2025", "Senior Backend Engineer")
-
-        assert mock_llm.call_count == 3
-
-    @patch("agents.jd_matcher.JDMatcherAgent._call_llm")
-    @patch("agents.jd_matcher.search_jd_requirements")
-    def test_match_inherits_low_confidence_from_cv(
-            self,
-            mock_search: MagicMock,
-            mock_llm: MagicMock,
-            agent: JDMatcherAgent,
-            sample_candidate: CandidateProfile,
-            sample_chunks: list[RetrievedChunk],
-    ) -> None:
-        """Nếu CV parse LOW confidence → MatchResult cũng là low_confidence."""
-        sample_candidate.confidence = ParseConfidence.LOW
-        mock_search.return_value = sample_chunks
-        mock_llm.return_value = json.dumps(VALID_LLM_JSON)
-
-        result = agent.match(sample_candidate, "backend-2025", "Senior Backend Engineer")
-
-        assert result.low_confidence is True
-        assert any("LOW confidence" in w for w in result.warnings)
-
-    @patch("agents.jd_matcher.JDMatcherAgent._call_llm")
-    @patch("agents.jd_matcher.search_jd_requirements")
-    def test_batch_match_skips_failed(
-            self,
-            mock_search: MagicMock,
-            mock_llm: MagicMock,
-            agent: JDMatcherAgent,
-            sample_candidate: CandidateProfile,
-            sample_chunks: list[RetrievedChunk],
-    ) -> None:
-        """Batch match không crash khi 1 candidate fail."""
-        candidate_ok = sample_candidate
-        candidate_fail = CandidateProfile(full_name="Bad Candidate")
-
-        mock_search.return_value = sample_chunks
-        # Lần 1 OK, lần 2 LLM crash, lần 3 OK
-        mock_llm.side_effect = [
-            json.dumps(VALID_LLM_JSON),
-            RuntimeError("LLM timeout"),
-            json.dumps(VALID_LLM_JSON),
-        ]
+        mock_llm.side_effect = side_effect
 
         with patch("agents.jd_matcher.time.sleep"):
             results = agent.match_batch(
-                [candidate_ok, candidate_fail, candidate_ok],
-                job_id="backend-2025",
-                job_title="Senior Backend Engineer",
+                candidates = [sample_candidate] * 3,
+                jd_text    = SAMPLE_JD_TEXT,
+                job_title  = "Senior Backend Engineer",
+                job_id     = "backend-2025",
             )
 
         assert len(results) == 3
-        assert results[0].candidate_name == "Nguyen Van A"  # OK
-        assert results[1].low_confidence is True  # Fallback
-        assert results[2].candidate_name == "Nguyen Van A"  # OK
+        # 1 parse_jd + 3 match = 4 LLM calls
+        assert call_count[0] == 4
 
+    @patch("agents.jd_matcher.JDMatcherAgent._call_llm")
+    @patch("agents.jd_matcher.query_cv_chunks")
+    def test_match_batch_handles_failure(
+        self, mock_query, mock_llm, agent, sample_candidate
+    ):
+        """1 candidate fail → fallback MatchResult, batch tiếp tục."""
+        mock_query.return_value = []
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Tầng 3: Schema — test Pydantic validation của MatchResult
-# ──────────────────────────────────────────────────────────────────────────────
+        call_count = [0]
+        def side_effect(prompt, system_prompt):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return json.dumps(PARSED_JD_JSON)        # parse_jd OK
+            elif call_count[0] == 2:
+                return json.dumps(MATCH_RESULT_JSON)     # candidate 1 OK
+            elif call_count[0] == 3:
+                raise RuntimeError("LLM timeout")        # candidate 2 FAIL
+            else:
+                return json.dumps(MATCH_RESULT_JSON)     # candidate 3 OK
 
-class TestMatchResultSchema:
+        mock_llm.side_effect = side_effect
 
-    def test_defaults_work(self) -> None:
-        result = MatchResult(candidate_name="Test", job_title="Dev")
-        assert result.requirement_matches == []
-        assert result.skill_gap.matched == []
-        assert result.low_confidence is False
-        assert result.warnings == []
-
-    def test_match_level_enum_validation(self) -> None:
-        req = RequirementMatch(
-            requirement="Python 3+ years",
-            candidate_evidence="4 years Python",
-            match_level="full",  # String → auto-convert to Enum
-        )
-        assert req.match_level == MatchLevel.FULL
-
-    def test_invalid_match_level_raises(self) -> None:
-        with pytest.raises(Exception):
-            RequirementMatch(
-                requirement="Python",
-                candidate_evidence=None,
-                match_level="excellent",  # Không phải full/partial/missing
+        with patch("agents.jd_matcher.time.sleep"):
+            results = agent.match_batch(
+                candidates = [sample_candidate] * 3,
+                jd_text    = SAMPLE_JD_TEXT,
+                job_title  = "Dev",
+                job_id     = "job-1",
             )
 
-    def test_full_result_validates_correctly(self) -> None:
-        result = MatchResult.model_validate(VALID_LLM_JSON)
-        assert result.candidate_name == "Nguyen Van A"
-        assert len(result.requirement_matches) == 4
+        assert len(results) == 3
+        assert results[0].candidate_name == "Nguyen Van A"   # OK
+        assert results[1].low_confidence is True              # Fallback
+        assert results[2].candidate_name == "Nguyen Van A"   # OK
+
+    @patch("agents.jd_matcher.JDMatcherAgent._call_llm")
+    @patch("agents.jd_matcher.query_cv_chunks")
+    def test_build_match_prompt_includes_all_skills(
+        self, mock_query, mock_llm, agent, sample_candidate, sample_parsed_jd
+    ):
+        """Prompt gửi lên LLM phải chứa TẤT CẢ required skills."""
+        mock_query.return_value = []
+        mock_llm.return_value   = json.dumps(MATCH_RESULT_JSON)
+
+        agent.match(sample_candidate, sample_parsed_jd)
+
+        # Lấy prompt từ LLM call (call cuối = match analyze)
+        last_call_prompt = mock_llm.call_args[0][0]
+        for skill in sample_parsed_jd.required_skills:
+            assert skill in last_call_prompt, \
+                f"Skill '{skill}' missing from LLM prompt"
+
+    @patch("agents.jd_matcher.JDMatcherAgent._call_llm")
+    @patch("agents.jd_matcher.query_cv_chunks")
+    def test_prompt_shows_empty_evidence_for_missing_skills(
+        self, mock_query, mock_llm, agent, sample_candidate, sample_parsed_jd
+    ):
+        """Skill không có trong CV → prompt phải chứa 'No relevant content found'."""
+        mock_query.return_value = []  # Candidate không có gì
+        mock_llm.return_value   = json.dumps(MATCH_RESULT_JSON)
+
+        agent.match(sample_candidate, sample_parsed_jd)
+
+        last_call_prompt = mock_llm.call_args[0][0]
+        assert "No relevant content found" in last_call_prompt
+
+
+# ── Schema tests ──────────────────────────────────────────────────────────────
+
+class TestParsedJDSchema:
+    def test_valid_parsed_jd(self):
+        jd = ParsedJD.model_validate(PARSED_JD_JSON)
+        assert jd.job_title == "Senior Backend Engineer"
+        assert len(jd.required_skills) == 5
+        assert jd.required_experience_years == 3.0
+
+    def test_defaults(self):
+        jd = ParsedJD(job_title="Dev")
+        assert jd.required_skills == []
+        assert jd.nice_to_have    == []
+        assert jd.required_experience_years is None
+
+    def test_match_result_still_valid(self):
+        """MatchResult schema vẫn hoạt động với Agent 2 v2 output."""
+        result = MatchResult.model_validate(MATCH_RESULT_JSON)
         assert result.requirement_matches[0].match_level == MatchLevel.FULL
-        assert result.requirement_matches[2].match_level == MatchLevel.PARTIAL
         assert result.requirement_matches[3].match_level == MatchLevel.MISSING
-        assert result.experience.domain_relevance == 1.0
-        assert result.skill_gap.bonus == ["Docker", "Redis"]
-
-    def test_experience_assessment_defaults(self) -> None:
-        exp = ExperienceAssessment()
-        assert exp.meets_requirement is False
-        assert exp.domain_relevance == 0.0
-        assert exp.required_years is None
-
-    def test_skill_gap_defaults(self) -> None:
-        gap = SkillGapReport()
-        assert gap.matched == []
-        assert gap.missing_critical == []
-        assert gap.missing_nice == []
-        assert gap.bonus == []

@@ -55,6 +55,7 @@ async def _run_pipeline_background(
     file_paths: list[str],
     job_id:     str,
     job_title:  str,
+    jd_text:    str,
     api_key:    str,
     tmpdir:     str,
 ) -> None:
@@ -74,12 +75,18 @@ async def _run_pipeline_background(
         scan_jobs[run_id]["progress"] = 0.05
         scan_jobs[run_id]["step"]     = f"Pipeline started for {len(file_paths)} CVs..."
 
+        # Log pipeline start với LangSmith metadata
+        from api.tracer import log_pipeline_start
+        meta = log_pipeline_start(run_id, job_id, job_title, len(file_paths))
+        scan_jobs[run_id]["langsmith_project"] = os.getenv("LANGCHAIN_PROJECT", "")
+
         # Stream từng node event
         for event in stream_pipeline(
             graph      = graph,
             file_paths = file_paths,
             job_id     = job_id,
             job_title  = job_title,
+            jd_text    = jd_text,
             api_key    = api_key,
         ):
             state_update = event.get("state", {})
@@ -123,6 +130,7 @@ async def start_scan(
     files:     list[UploadFile] = File(..., description="CV files (PDF/DOCX)"),
     job_id:    str              = Form(...),
     job_title: str              = Form(...),
+    jd_text:   str              = Form("", description="Full JD text cho Agent 2 parse"),
     api_key:   str              = Form(..., description="Gemini API key"),
 ):
     """
@@ -183,6 +191,7 @@ async def start_scan(
         "error":     None,
         "job_id":    job_id,
         "job_title": job_title,
+        "jd_text":   jd_text,
         "file_count": len(file_paths),
     }
 
@@ -193,6 +202,7 @@ async def start_scan(
         file_paths = file_paths,
         job_id     = job_id,
         job_title  = job_title,
+        jd_text    = jd_text,
         api_key    = api_key,
         tmpdir     = tmpdir,
     )

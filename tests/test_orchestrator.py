@@ -362,6 +362,7 @@ class TestFullPipeline:
             graph      = graph,
             file_paths = ["cv1.pdf"],
             job_id     = "backend-2025",
+            jd_text    = "Test",
             job_title  = "Senior Backend Engineer",
             api_key    = "fake-key",
         )
@@ -386,6 +387,7 @@ class TestFullPipeline:
             graph      = graph,
             file_paths = ["bad.pdf"],
             job_id     = "backend-2025",
+            jd_text    = "Test",
             job_title  = "Dev",
             api_key    = "fake-key",
         )
@@ -422,6 +424,7 @@ class TestFullPipeline:
             graph      = graph,
             file_paths = ["cv1.pdf", "cv2.pdf"],
             job_id     = "backend-2025",
+            jd_text    = "Test",
             job_title  = "Dev",
             api_key    = "fake-key",
         )
@@ -438,6 +441,7 @@ class TestFullPipeline:
             run_pipeline(
                 graph=graph, file_paths=[],
                 job_id="j", job_title="t", api_key="k",
+                jd_text= "Test",
             )
 
     @patch("graph.nodes.ReportWriterAgent")

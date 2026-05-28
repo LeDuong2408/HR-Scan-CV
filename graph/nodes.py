@@ -1,32 +1,29 @@
 """
-LangGraph Nodes
+LangGraph Nodes (v2)
 
-Mỗi node là 1 function nhận GraphState → trả về dict (partial state update).
-LangGraph tự merge dict đó vào state hiện tại.
+Cập nhật để tương thích với:
+  - Agent 1 v2: CVParserAgent → ParsedCV (không còn CandidateProfile, không cần api_key)
+  - Agent 2 v2: JDMatcherAgent.match_batch() nhận jd_text + job_title + job_id
+  - Agent 3:    ScorerAgent.score_and_rank() nhận list[MatchResult] + list[ParsedCV]
 
-Nguyên tắc thiết kế mỗi node:
-  1. Log progress trước khi làm — Chainlit stream được
+Nguyên tắc mỗi node:
+  1. Validate input state trước — fail sớm nếu thiếu data
   2. Gọi agent tương ứng
-  3. Catch exception → ghi vào state.errors, không re-raise
-  4. Cập nhật status + progress
-  5. Return dict — không return toàn bộ state
-
-Tại sao không gọi agent.parse_batch() / match_batch()?
-  Gọi batch methods trong node đơn giản hơn và đủ dùng cho demo.
-  Khi cần scale, các node này có thể được fan-out thành
-  Send() API của LangGraph để xử lý song song từng file.
+  3. Catch exception → ghi errors, không re-raise
+  4. Cập nhật status + progress + current_step
+  5. Return dict partial update — LangGraph tự merge vào state
 """
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
-from agents.cv_parser import CVParserAgent
+from agents.cv_parser import CVParserAgent, ParsedCV
 from agents.jd_matcher import JDMatcherAgent
 from agents.report_writer import ReportWriterAgent
 from agents.scorer import ScorerAgent
 from graph.state import GraphState, PipelineStatus
-from schemas.cv_schema import CandidateProfile
 
 logger = logging.getLogger(__name__)
 
@@ -37,30 +34,49 @@ logger = logging.getLogger(__name__)
 
 def parse_node(state: GraphState) -> dict[str, Any]:
     """
-    Node 1: Parse tất cả CV files → list[CandidateProfile].
+    Node 1: Convert CV files → Markdown → Chunks → ChromaDB.
+    Trả về list[ParsedCV] với cv_id để Node 2 query ChromaDB.
 
-    Input state:  file_paths, api_key
+    Không gọi LLM — nhanh hơn v1, không tốn API quota.
+
+    Input state:  file_paths
     Output state: parsed_candidates, parse_errors, status, progress
     """
+    # LangSmith node name
+    if os.getenv("LANGCHAIN_TRACING_V2") == "true":
+        try:
+            from langsmith import get_current_run_tree
+            rt = get_current_run_tree()
+            if rt:
+                rt.name = "node:parse"
+        except Exception:
+            pass
+
     logger.info("=== NODE: parse (%d files) ===", len(state.file_paths))
 
-    agent  = CVParserAgent(api_key=state.api_key)
-    parsed: list[CandidateProfile] = []
-    errors: list[str] = []
-
-    total = len(state.file_paths)
+    # reprocess=True: nếu cùng file upload lại → xóa chunks cũ, process lại
+    agent  = CVParserAgent(reprocess=True)
+    parsed: list[ParsedCV] = []
+    errors: list[str]      = []
+    total  = len(state.file_paths)
 
     for i, path in enumerate(state.file_paths, 1):
         try:
             profile = agent.parse(path)
             parsed.append(profile)
-            logger.info("[%d/%d] Parsed: %s", i, total, profile.full_name)
+            logger.info(
+                "[%d/%d] Parsed: %s | cv_id=%s | %d chunks | sections=%s",
+                i, total,
+                profile.candidate_name,
+                profile.cv_id,
+                profile.chunk_count,
+                profile.sections,
+            )
         except Exception as e:
             msg = f"Failed to parse {path}: {e}"
             logger.error(msg)
             errors.append(msg)
 
-    # Nếu không parse được file nào → fail sớm
     if not parsed:
         return {
             "status":       PipelineStatus.FAILED,
@@ -85,9 +101,14 @@ def parse_node(state: GraphState) -> dict[str, Any]:
 
 def match_node(state: GraphState) -> dict[str, Any]:
     """
-    Node 2: Match từng CandidateProfile với JD → list[MatchResult].
+    Node 2: Parse JD → query ChromaDB evidence per skill → analyze match.
 
-    Input state:  parsed_candidates, job_id, job_title, api_key
+    Pipeline nội bộ của agent:
+      1. LLM parse jd_text → ParsedJD (required_skills, experience...)  [cache]
+      2. Với mỗi required_skill: query cv_chunks của candidate đó
+      3. LLM analyze evidence → MatchResult
+
+    Input state:  parsed_candidates, jd_text, job_id, job_title, api_key
     Output state: match_results, status, progress
     """
     logger.info("=== NODE: match (%d candidates) ===", len(state.parsed_candidates))
@@ -95,42 +116,65 @@ def match_node(state: GraphState) -> dict[str, Any]:
     if not state.parsed_candidates:
         return {
             "status": PipelineStatus.FAILED,
-            "errors": ["match_node received empty parsed_candidates"],
+            "errors": ["match_node: parsed_candidates is empty"],
+        }
+
+    if not state.jd_text or len(state.jd_text.strip()) < 10:
+        return {
+            "status": PipelineStatus.FAILED,
+            "errors": [
+                "match_node: jd_text is missing or too short. "
+                "Provide full Job Description text when starting the scan."
+            ],
         }
 
     agent   = JDMatcherAgent(api_key=state.api_key)
     results = agent.match_batch(
         candidates = state.parsed_candidates,
-        job_id     = state.job_id,
+        jd_text    = state.jd_text,
         job_title  = state.job_title,
+        job_id     = state.job_id,
     )
 
+    low_conf = sum(1 for r in results if r.low_confidence)
+    if low_conf:
+        logger.warning("%d/%d matches flagged low_confidence", low_conf, len(results))
+
     return {
-        "status":       PipelineStatus.SCORING,
-        "current_step": f"Matched {len(results)} candidates. Starting scoring...",
+        "status":        PipelineStatus.SCORING,
+        "current_step":  f"Matched {len(results)} candidates. Starting scoring...",
         "match_results": results,
-        "progress":     0.55,
+        "progress":      0.55,
     }
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Node 3: Score and rank candidates
+# Node 3: Score and rank
 # ──────────────────────────────────────────────────────────────────────────────
 
 def score_node(state: GraphState) -> dict[str, Any]:
     """
-    Node 3: Score từng MatchResult → RankedCandidate list.
+    Node 3: Chấm điểm hybrid (programmatic + LLM) → xếp hạng toàn batch.
 
     Input state:  match_results, parsed_candidates, job_id, api_key
     Output state: ranked_candidates, status, progress
+
+    Note: ScorerAgent nhận list[ParsedCV] (v2) thay vì list[CandidateProfile] (v1).
+    Scorer dùng parsed_candidates để lấy education/achievements cho LLM scoring.
     """
     logger.info("=== NODE: score (%d candidates) ===", len(state.match_results))
 
     if not state.match_results:
         return {
             "status": PipelineStatus.FAILED,
-            "errors": ["score_node received empty match_results"],
+            "errors": ["score_node: match_results is empty"],
         }
+
+    if len(state.match_results) != len(state.parsed_candidates):
+        logger.warning(
+            "Mismatch: %d match_results vs %d parsed_candidates — using min length",
+            len(state.match_results), len(state.parsed_candidates),
+        )
 
     agent  = ScorerAgent(api_key=state.api_key)
     ranked = agent.score_and_rank(
@@ -153,7 +197,8 @@ def score_node(state: GraphState) -> dict[str, Any]:
 
 def report_node(state: GraphState) -> dict[str, Any]:
     """
-    Node 4: Generate PDF report từ ranked candidates.
+    Node 4: Tạo PDF report từ ranked candidates.
+    Không gọi LLM — deterministic, nhanh.
 
     Input state:  ranked_candidates, job_id, job_title
     Output state: report, status, progress
@@ -163,14 +208,12 @@ def report_node(state: GraphState) -> dict[str, Any]:
     if not state.ranked_candidates:
         return {
             "status": PipelineStatus.FAILED,
-            "errors": ["report_node received empty ranked_candidates"],
+            "errors": ["report_node: ranked_candidates is empty"],
         }
 
-    # use_s3=True nếu có S3_BUCKET_NAME env var, ngược lại lưu local
-    import os
     use_s3 = bool(os.getenv("S3_BUCKET_NAME"))
-
     agent  = ReportWriterAgent(use_s3=use_s3)
+
     report = agent.write(
         ranked    = state.ranked_candidates,
         job_title = state.job_title,
@@ -179,43 +222,33 @@ def report_node(state: GraphState) -> dict[str, Any]:
 
     return {
         "status":       PipelineStatus.COMPLETED,
-        "current_step": f"Done! Report {report.meta.report_id} — {len(report.shortlist)} candidates shortlisted.",
-        "report":       report,
-        "progress":     1.0,
+        "current_step": (
+            f"Done! Report {report.meta.report_id} — "
+            f"{len(report.shortlist)} candidates shortlisted."
+        ),
+        "report":   report,
+        "progress": 1.0,
     }
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Conditional edges — quyết định node nào chạy tiếp theo
+# Conditional edges
 # ──────────────────────────────────────────────────────────────────────────────
 
 def should_continue_after_parse(state: GraphState) -> str:
-    """
-    Sau parse node: tiếp tục match hay kết thúc với lỗi?
-
-    Returns:
-        "match"  → chạy match_node tiếp
-        "failed" → kết thúc pipeline với lỗi
-    """
     if state.status == PipelineStatus.FAILED:
-        logger.error("Pipeline failed at parse stage: %s", state.errors)
+        logger.error("Pipeline failed at parse: %s", state.errors)
         return "failed"
     return "match"
 
 
 def should_continue_after_match(state: GraphState) -> str:
-    """Sau match node → score hay failed?"""
     if state.status == PipelineStatus.FAILED:
         return "failed"
-    # Cảnh báo nếu có empty matches nhưng không abort
-    empty = sum(1 for m in state.match_results if m.low_confidence)
-    if empty > 0:
-        logger.warning("%d/%d matches have low confidence", empty, len(state.match_results))
     return "score"
 
 
 def should_continue_after_score(state: GraphState) -> str:
-    """Sau score node → report hay failed?"""
     if state.status == PipelineStatus.FAILED:
         return "failed"
     return "report"

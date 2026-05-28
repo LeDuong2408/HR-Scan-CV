@@ -139,6 +139,7 @@ def run_pipeline(
     graph:      Any,
     file_paths: list[str],
     job_id:     str,
+    jd_text:    str,
     job_title:  str,
     api_key:    str,
 ) -> GraphState:
@@ -150,6 +151,7 @@ def run_pipeline(
         file_paths: List đường dẫn đến CV files
         job_id:     ID của JD đã ingest vào ChromaDB
         job_title:  Tên vị trí
+        jd_text:    Thông tin JD,
         api_key:    Gemini API key
 
     Returns:
@@ -161,6 +163,7 @@ def run_pipeline(
     initial_state = GraphState(
         file_paths = file_paths,
         job_id     = job_id,
+        jd_text    = jd_text,
         job_title  = job_title,
         api_key    = api_key,
         status     = PipelineStatus.PARSING,
@@ -190,6 +193,7 @@ def stream_pipeline(
     graph:      Any,
     file_paths: list[str],
     job_id:     str,
+    jd_text:     str,
     job_title:  str,
     api_key:    str,
 ):
@@ -208,6 +212,7 @@ def stream_pipeline(
     initial_state = GraphState(
         file_paths   = file_paths,
         job_id       = job_id,
+        jd_text      = jd_text,
         job_title    = job_title,
         api_key      = api_key,
         status       = PipelineStatus.PARSING,

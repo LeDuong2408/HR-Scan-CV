@@ -13,13 +13,16 @@ pip install -r requirements.txt
 Run API:
 
 ```bash
-uvicorn api.main:app --reload
+uvicorn api.main:app --reload --port 8000
 ```
 
 Run UI:
 
 ```bash
 chainlit run frontend/app.py -w
+```
+```bash
+streamlit run frontend/streamlit_app.py
 ```
 
 Run tests:

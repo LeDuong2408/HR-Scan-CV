@@ -1,11 +1,11 @@
 """
-Streamlit Frontend — HR CV Scanner
+Streamlit Frontend — HR CV Scanner v2
 
-Chạy: streamlit run frontend/streamlit_app.py --server.port 8001
-
-Không cần Chainlit — Streamlit ổn định hơn trên Windows.
+Thay đổi so với v1:
+  + Thêm JD text area (Agent 2 v2 cần full JD text để parse)
+  + Fix double sleep bug trong progress tracking
+  + Sidebar gọn hơn, validation rõ hơn
 """
-import json
 import os
 import time
 from io import BytesIO
@@ -29,15 +29,15 @@ st.set_page_config(
     layout     = "wide",
 )
 
-# ── Session state defaults ────────────────────────────────────────────────────
+# ── Session state ─────────────────────────────────────────────────────────────
 def _init_state():
     defaults = {
         "job_id":    "",
         "job_title": "",
+        "jd_text":   "",
         "api_key":   os.getenv("GEMINI_API_KEY", ""),
         "run_id":    None,
         "status":    None,
-        "report":    None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -57,32 +57,22 @@ def _get(path: str, timeout: int = 10) -> dict | None:
         return None
 
 
-def _post(path: str, **kwargs) -> dict | None:
-    try:
-        r = httpx.post(f"{API_BASE}{path}", timeout=60, **kwargs)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        st.error(f"API error: {e}")
-        return None
-
-
-def _progress_bar_text(p: float) -> str:
+def _progress_bar(p: float) -> str:
     filled = int(p * 20)
     return f"[{'█' * filled}{'░' * (20 - filled)}] {int(p * 100)}%"
 
 
-# ── Sidebar: Configuration ────────────────────────────────────────────────────
+# ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("⚙️ Cấu hình")
 
-    # API key
+    # Gemini API Key
     st.subheader("🔑 Gemini API Key")
     api_key = st.text_input(
         "API Key",
-        value    = st.session_state.api_key,
-        type     = "password",
-        help     = "Lấy miễn phí tại aistudio.google.com/apikey",
+        value = st.session_state.api_key,
+        type  = "password",
+        help  = "Lấy miễn phí tại aistudio.google.com/apikey",
     )
     st.session_state.api_key = api_key
 
@@ -102,77 +92,113 @@ with st.sidebar:
             st.session_state.job_title = j["job_title"]
     else:
         st.warning("Chưa có Job nào. Tạo qua API trước.")
-        st.code(
-            'curl -X POST http://localhost:8000/api/v1/jobs/ \\\n'
-            '  -H "Content-Type: application/json" \\\n'
-            '  -d \'{"job_id":"backend-2025","job_title":"Senior Backend",'
-            '"requirements":["Python 3+ years","FastAPI experience"]}\'',
-            language="bash",
-        )
-        # Cho phép nhập tay nếu chưa có
-        st.session_state.job_id    = st.text_input("Job ID (nhập tay)", value=st.session_state.job_id)
-        st.session_state.job_title = st.text_input("Job Title",         value=st.session_state.job_title)
+        st.session_state.job_id    = st.text_input("Job ID",    value=st.session_state.job_id)
+        st.session_state.job_title = st.text_input("Job Title", value=st.session_state.job_title)
 
     st.divider()
 
     # Backend status
-    st.subheader("🔌 Backend Status")
+    st.subheader("🔌 Backend")
     try:
         h = httpx.get("http://localhost:8000/health", timeout=2)
+        d = h.json()
         if h.status_code == 200:
             st.success("FastAPI: Running ✅")
+            active = d.get("active_scans", 0)
+            if active:
+                st.info(f"Đang xử lý: {active} scan(s)")
         else:
             st.error("FastAPI: Error ❌")
     except Exception:
-        st.error("FastAPI: Offline ❌\nChạy: `uvicorn api.main:app --reload`")
+        st.error("FastAPI: Offline ❌")
+        st.code("uvicorn api.main:app --reload --port 8000")
 
 
-# ── Main: Upload và Scan ──────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 st.title("📋 HR CV Scanner")
-st.caption("Multi-agent AI system: Parse → Match → Score → Report")
+st.caption("Multi-agent AI: Parse → Match → Score → Report")
 
-tab1, tab2, tab3 = st.tabs(["🚀 Scan CVs", "📊 Kết quả", "📥 Download Report"])
+tab1, tab2, tab3 = st.tabs(["🚀 Scan CVs", "📊 Kết quả", "📥 Download"])
 
-# ─── Tab 1: Scan ─────────────────────────────────────────────────────────────
+
+# ─── Tab 1: Scan ──────────────────────────────────────────────────────────────
 with tab1:
-    st.subheader("Upload CV Files")
 
-    uploaded_files = st.file_uploader(
-        "Chọn CV files (PDF/DOCX)",
-        type            = ["pdf", "docx", "doc"],
-        accept_multiple_files = True,
-        help            = "Kéo thả nhiều files cùng lúc",
-    )
+    col_left, col_right = st.columns([1, 1], gap="large")
 
-    if uploaded_files:
-        st.info(f"📄 Đã chọn {len(uploaded_files)} files: " + ", ".join(f.name for f in uploaded_files))
+    # Cột trái: Upload CVs
+    with col_left:
+        st.subheader("📤 Upload CVs")
+        uploaded_files = st.file_uploader(
+            "Chọn CV files (PDF/DOCX)",
+            type                  = ["pdf", "docx", "doc"],
+            accept_multiple_files = True,
+            help                  = "Hỗ trợ PDF, DOCX, DOC",
+        )
+        if uploaded_files:
+            st.success(f"✅ {len(uploaded_files)} file(s) đã chọn")
+            for f in uploaded_files:
+                st.caption(f"📄 {f.name}")
+
+    # Cột phải: JD Text
+    with col_right:
+        st.subheader("📋 Job Description")
+        st.caption("Paste full JD text — Agent 2 sẽ tự phân tích thành các trường yêu cầu")
+        jd_text = st.text_area(
+            "Full JD Text",
+            value       = st.session_state.jd_text,
+            height      = 250,
+            placeholder = (
+                "Senior Backend Engineer\n\n"
+                "Requirements:\n"
+                "- 3+ years Python backend development\n"
+                "- FastAPI or Django\n"
+                "- AWS Lambda and S3\n"
+                "- PostgreSQL and Redis\n"
+                "- Docker and CI/CD\n\n"
+                "Nice to have:\n"
+                "- Kubernetes\n"
+                "- Terraform"
+            ),
+            label_visibility = "collapsed",
+        )
+        st.session_state.jd_text = jd_text
+        if jd_text:
+            word_count = len(jd_text.split())
+            st.caption(f"📝 {word_count} từ")
 
     st.divider()
 
-    # Validate trước khi scan
-    ready = True
+    # Validation
+    issues = []
     if not st.session_state.api_key:
-        st.warning("⚠️ Chưa có Gemini API Key — nhập ở sidebar")
-        ready = False
+        issues.append("⚠️ Chưa có Gemini API Key (nhập ở sidebar)")
     if not st.session_state.job_id:
-        st.warning("⚠️ Chưa chọn Job — chọn ở sidebar")
-        ready = False
+        issues.append("⚠️ Chưa chọn Job (chọn ở sidebar)")
+    if not jd_text or len(jd_text.strip()) < 50:
+        issues.append("⚠️ JD text quá ngắn — paste đầy đủ JD để Agent 2 phân tích chính xác")
     if not uploaded_files:
-        st.warning("⚠️ Chưa upload CV files")
-        ready = False
+        issues.append("⚠️ Chưa upload CV files")
 
-    # Nút Scan
+    for issue in issues:
+        st.warning(issue)
+
+    # Nút scan
+    can_scan = len(issues) == 0
     if st.button(
         "🚀 Bắt đầu Scan",
-        disabled = not ready,
-        type     = "primary",
+        disabled            = not can_scan,
+        type                = "primary",
         use_container_width = True,
     ):
-        with st.spinner("Đang upload files..."):
+        with st.spinner(f"Đang upload {len(uploaded_files)} files..."):
             form_files = []
             for f in uploaded_files:
-                mime = "application/pdf" if f.name.endswith(".pdf") else \
-                       "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                mime = (
+                    "application/pdf"
+                    if f.name.lower().endswith(".pdf")
+                    else "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                )
                 form_files.append(("files", (f.name, BytesIO(f.read()), mime)))
 
             result = None
@@ -183,6 +209,7 @@ with tab1:
                     data    = {
                         "job_id":    st.session_state.job_id,
                         "job_title": st.session_state.job_title,
+                        "jd_text":   st.session_state.jd_text,
                         "api_key":   st.session_state.api_key,
                     },
                     timeout = 60,
@@ -202,44 +229,35 @@ with tab1:
     if st.session_state.run_id and st.session_state.status == "running":
         st.divider()
         run_id = st.session_state.run_id
-        st.subheader(f"⏳ Pipeline đang chạy — `{run_id}`")
+        st.subheader(f"⏳ Đang chạy — `{run_id}`")
 
-        progress_placeholder = st.empty()
-        step_placeholder     = st.empty()
-
-        # Lấy status hiện tại (1 lần mỗi rerun)
+        # 1 lần fetch mỗi rerun (không block)
         data = _get(f"/scan/status/{run_id}")
-
         if not data:
-            st.error("Không kết nối được backend. Kiểm tra FastAPI đang chạy.")
+            st.error("Không kết nối được backend.")
         else:
-            progress = data.get("progress", 0)
-            step     = data.get("step",     "")
-            status   = data.get("status",   "running")
-            error    = data.get("error",    "")
+            progress = float(data.get("progress", 0))
+            step     = data.get("step",   "")
+            status   = data.get("status", "running")
+            error    = data.get("error",  "")
 
-            progress_placeholder.progress(
-                float(progress),
-                text=f"**{status.upper()}** — {_progress_bar_text(progress)}",
-            )
-            step_placeholder.info(f"📍 {step}")
+            st.progress(progress, text=f"**{status.upper()}** — {_progress_bar(progress)}")
+            st.info(f"📍 {step}")
 
             if status == "completed":
                 st.session_state.status = "completed"
                 st.balloons()
-                st.success("✅ Pipeline hoàn thành! Xem kết quả ở tab **Kết quả**.")
+                st.success("✅ Xong! Xem kết quả ở tab **Kết quả**.")
                 st.rerun()
 
             elif status == "failed":
                 st.session_state.status = "failed"
-                st.error(f"❌ Pipeline thất bại: {error}")
+                st.error(f"❌ Thất bại: {error}")
 
             else:
-                # Vẫn đang chạy → auto-refresh sau 3 giây
+                # Vẫn đang chạy → rerun sau 3s
                 time.sleep(3)
                 st.rerun()
-
-            time.sleep(2)  # Poll mỗi 2 giây
 
 
 # ─── Tab 2: Kết quả ───────────────────────────────────────────────────────────
@@ -251,43 +269,54 @@ with tab2:
     else:
         st.subheader(f"Kết quả — Run `{run_id}`")
 
-        # Lấy report
         report_data = _get(f"/reports/run/{run_id}")
 
         if report_data is None:
-            # Có thể chưa xong
-            data = _get(f"/scan/status/{run_id}")
-            if data:
-                st.info(f"Status: `{data['status']}` — {data.get('step','')}")
-                st.progress(data.get("progress", 0))
+            status_data = _get(f"/scan/status/{run_id}")
+            if status_data:
+                pct = float(status_data.get("progress", 0))
+                st.progress(pct, text=f"Status: `{status_data['status']}`")
+                st.info(status_data.get("step", ""))
         else:
-            # Summary cards
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("Tổng ứng viên",  report_data["total_candidates"])
-            col2.metric("Shortlist",       report_data["shortlist_count"])
-            col3.metric("Report ID",       report_data["report_id"])
-            col4.metric("Job",             report_data["job_title"][:20])
+            # Metrics row
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Tổng ứng viên",  report_data["total_candidates"])
+            c2.metric("Shortlist",       report_data["shortlist_count"])
+            c3.metric("Report ID",       report_data["report_id"])
+            c4.metric("Job",             report_data["job_title"][:18])
 
             st.divider()
 
-            # Summary text
+            # LangSmith link
+            langsmith_key = os.getenv("LANGSMITH_API_KEY", "")
+            if langsmith_key:
+                project = os.getenv("LANGCHAIN_PROJECT", "hr-cv-scanner")
+                st.info(
+                    f"🔍 [Xem chi tiết agent trace trên LangSmith]"
+                    f"(https://smith.langchain.com/o/default/projects/{project})"
+                )
+
+            # Summary
             with st.expander("📋 Summary", expanded=True):
                 st.markdown(report_data.get("summary_text", ""))
 
-            # Shortlist table
+            st.divider()
+
+            # Bảng xếp hạng
             st.subheader("🏆 Bảng xếp hạng")
             shortlist = report_data.get("shortlist", [])
 
             if shortlist:
                 for c in shortlist:
-                    emoji = TIER_COLOR.get(c["tier"], "⚪")
+                    emoji = TIER_COLOR.get(c.get("tier", ""), "⚪")
                     with st.container(border=True):
-                        col_r, col_n, col_s, col_t, col_rec = st.columns([1, 3, 2, 2, 4])
-                        col_r.markdown(f"**#{c['rank']}**")
-                        col_n.markdown(f"**{c['name']}**")
-                        col_s.markdown(f"`{c['total_score']}/100`")
-                        col_t.markdown(f"{emoji} {c['tier'].upper()}")
-                        col_rec.markdown(c.get("recommendation", "") or "")
+                        col_rank, col_name, col_score, col_tier, col_rec = \
+                            st.columns([1, 3, 2, 2, 4])
+                        col_rank.markdown(f"**#{c['rank']}**")
+                        col_name.markdown(f"**{c['name']}**")
+                        col_score.markdown(f"`{c['total_score']}/100`")
+                        col_tier.markdown(f"{emoji} {c.get('tier','').upper()}")
+                        col_rec.caption(c.get("recommendation", "") or "")
             else:
                 st.warning("Không có dữ liệu shortlist.")
 
@@ -299,33 +328,27 @@ with tab3:
     if not run_id:
         st.info("Chạy scan ở tab **Scan CVs** trước.")
     elif st.session_state.status != "completed":
-        st.info("Đợi pipeline hoàn thành.")
+        st.info("⏳ Đợi pipeline hoàn thành trước khi download.")
     else:
         st.subheader("📥 Download PDF Report")
-
-        # Lấy PDF binary
         try:
             r = httpx.get(
                 f"{API_BASE}/reports/run/{run_id}/download",
-                timeout=30,
+                timeout = 30,
             )
             r.raise_for_status()
             pdf_bytes = r.content
 
             st.download_button(
-                label    = "⬇️ Download PDF Report",
-                data     = pdf_bytes,
-                file_name = f"cv_report_{run_id}.pdf",
-                mime     = "application/pdf",
-                type     = "primary",
+                label               = "⬇️ Download PDF Report",
+                data                = pdf_bytes,
+                file_name           = f"cv_report_{run_id}.pdf",
+                mime                = "application/pdf",
+                type                = "primary",
                 use_container_width = True,
             )
-
             st.caption(f"Size: {len(pdf_bytes) / 1024:.1f} KB")
 
         except Exception as e:
             st.error(f"Không lấy được PDF: {e}")
-            st.info(
-                f"Thử download trực tiếp:\n"
-                f"`{API_BASE}/reports/run/{run_id}/download`"
-            )
+            st.code(f"{API_BASE}/reports/run/{run_id}/download")

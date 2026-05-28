@@ -36,8 +36,15 @@ from google.genai import types as genai_types
 
 from prompts.scorer_prompt import SCORER_SYSTEM_PROMPT, SCORER_USER_TEMPLATE
 from rag.retriever import get_rubric
-from schemas.cv_schema import CandidateProfile, EducationLevel
+
+from agents.cv_parser import ParsedCV
 from schemas.match_schema import MatchResult
+try:
+    from langsmith import traceable as _traceable
+    _TRACE = True
+except ImportError:
+    _TRACE = False
+
 from schemas.score_schema import (
     CandidateScore,
     DimensionScore,
@@ -72,7 +79,7 @@ class ScorerAgent:
         # Score và rank toàn bộ batch
         ranked = agent.score_and_rank(
             matches=[...],       # list[MatchResult]
-            candidates=[...],    # list[CandidateProfile]
+            candidates=[...],    # list[ParsedCV]
             job_id="backend-2025",
         )
         # ranked[0] là ứng viên tốt nhất
@@ -81,7 +88,7 @@ class ScorerAgent:
     def __init__(
         self,
         api_key:       str,
-        model:         str = "gemini-2.5-flash",
+        model:         str = "gemini-3.5-flash",
         system_prompt: str = SCORER_SYSTEM_PROMPT,
     ) -> None:
         self.client        = genai.Client(api_key=api_key)
@@ -95,7 +102,23 @@ class ScorerAgent:
     def score(
         self,
         match:     MatchResult,
-        candidate: CandidateProfile,
+        candidate: ParsedCV,
+        job_id:    str,
+    ) -> CandidateScore:
+        if _TRACE:
+            from langsmith import traceable
+            return traceable(
+                name="ScorerAgent.score",
+                run_type="chain",
+                tags=["scorer", "agent-3"],
+                metadata={"candidate": candidate.candidate_name, "job_id": job_id},
+            )(self._score_internal)(match, candidate, job_id)
+        return self._score_internal(match, candidate, job_id)
+
+    def _score_internal(
+        self,
+        match:     MatchResult,
+        candidate: ParsedCV,
         job_id:    str,
     ) -> CandidateScore:
         """
@@ -109,7 +132,7 @@ class ScorerAgent:
         Returns:
             CandidateScore với điểm từng dimension và tổng điểm
         """
-        logger.info("Scoring candidate: %s", candidate.full_name)
+        logger.info("Scoring candidate: %s", candidate.candidate_name)
 
         # Bước 1: Load rubric
         rubric = self._load_rubric(job_id)
@@ -136,7 +159,7 @@ class ScorerAgent:
         )
 
         result = CandidateScore(
-            candidate_name = candidate.full_name,
+            candidate_name = candidate.candidate_name,
             job_title      = match.job_title,
             total_score    = total_score,
             breakdown      = breakdown,
@@ -150,14 +173,14 @@ class ScorerAgent:
 
         logger.info(
             "Scored %s: %.1f/100 (%s)",
-            candidate.full_name, total_score, result.tier,
+            candidate.candidate_name, total_score, result.tier,
         )
         return result
 
     def score_and_rank(
         self,
         matches:    list[MatchResult],
-        candidates: list[CandidateProfile],
+        candidates: list[ParsedCV],
         job_id:     str,
     ) -> list[RankedCandidate]:
         """
@@ -181,13 +204,13 @@ class ScorerAgent:
 
         for i, (match, candidate) in enumerate(zip(matches, candidates), 1):
             logger.info(
-                "Batch scoring %d/%d: %s", i, len(candidates), candidate.full_name
+                "Batch scoring %d/%d: %s", i, len(candidates), candidate.candidate_name
             )
             try:
                 score = self.score(match, candidate, job_id)
             except Exception as e:
-                logger.error("Score failed for %s: %s — using 0", candidate.full_name, e)
-                score = self._fallback_score(candidate.full_name, match.job_title, str(e))
+                logger.error("Score failed for %s: %s — using 0", candidate.candidate_name, e)
+                score = self._fallback_score(candidate.candidate_name, match.job_title, str(e))
 
             scores.append(score)
 
@@ -228,7 +251,7 @@ class ScorerAgent:
     def _score_programmatic(
         self,
         match:     MatchResult,
-        candidate: CandidateProfile,
+        candidate: ParsedCV,
         rubric:    ScoringRubric,
     ) -> dict[str, DimensionScore]:
         """
@@ -371,7 +394,7 @@ class ScorerAgent:
     def _score_llm_dimensions(
         self,
         match:     MatchResult,
-        candidate: CandidateProfile,
+        candidate: ParsedCV,
         rubric:    ScoringRubric,
     ) -> tuple[dict[str, DimensionScore], list[str], list[str], str]:
         """
@@ -395,7 +418,7 @@ class ScorerAgent:
     def _build_llm_prompt(
         self,
         match:     MatchResult,
-        candidate: CandidateProfile,
+        candidate: ParsedCV,
         rubric:    ScoringRubric,
         llm_dims:  dict,
     ) -> str:
@@ -421,33 +444,29 @@ class ScorerAgent:
             ],
         }
 
-        # Candidate profile (chỉ phần liên quan đến LLM dims)
+        # ParsedCV v2: dùng markdown sections thay vì structured fields
+        # Lấy phần relevant từ markdown (Education, Skills, Certifications)
+        relevant_sections = []
+        if candidate.markdown:
+            lines = candidate.markdown.splitlines()
+            capture = False
+            for line in lines:
+                stripped = line.strip()
+                if stripped.startswith("#"):
+                    section_name = stripped.lstrip("#").strip().lower()
+                    capture = any(kw in section_name for kw in [
+                        "education", "skill", "certif", "language",
+                        "award", "achievement", "summary", "profile",
+                    ])
+                if capture:
+                    relevant_sections.append(line)
+
         candidate_summary = {
-            "education": [
-                {
-                    "institution": e.institution,
-                    "degree":      e.degree,
-                    "level":       e.level,
-                    "major":       e.major,
-                    "gpa":         e.gpa,
-                }
-                for e in candidate.education
-            ],
-            "work_history": [
-                {
-                    "company":      w.company,
-                    "role":         w.role,
-                    "achievements": w.achievements,
-                    "duration_months": w.duration_months,
-                }
-                for w in candidate.work_history
-            ],
-            "certifications": candidate.certifications,
-            "languages":      [
-                {"language": l.language, "proficiency": l.proficiency}
-                for l in candidate.languages
-            ],
-            "soft_skills": candidate.soft_skills,
+            "candidate_name": candidate.candidate_name,
+            "file_name":      candidate.file_name,
+            "detected_sections": candidate.sections,
+            "cv_excerpt":     "\n".join(relevant_sections[:60]) if relevant_sections
+                              else "(No structured sections detected — see full CV in ChromaDB)",
         }
 
         # Format dimensions cần score
